@@ -1,0 +1,70 @@
+import boto3
+import time
+from datetime import datetime, timedelta
+
+ec2 = boto3.client('ec2')
+
+RETENTION_DAYS = 7
+KMS_KEY_ALIAS = 'alias/ebs-backup-key'
+
+def lambda_handler(event, context):
+    print("Starting secure encrypted backup")
+
+    volumes = ec2.describe_volumes()['Volumes']
+
+    for volume in volumes:
+        volume_id = volume['VolumeId']
+
+        print(f"Creating snapshot for {volume_id}")
+
+        snapshot = ec2.create_snapshot(
+            VolumeId=volume_id,
+            Description='Temp snapshot for encryption'
+        )
+
+        snapshot_id = snapshot['SnapshotId']
+
+        wait_for_snapshot(snapshot_id)
+
+        print(f"Encrypting snapshot {snapshot_id}")
+
+        encrypted = ec2.copy_snapshot(
+            SourceSnapshotId=snapshot_id,
+            SourceRegion='us-east-1',
+            Encrypted=True,
+            KmsKeyId=KMS_KEY_ALIAS,
+            Description='Encrypted automated backup'
+        )
+
+        encrypted_id = encrypted['SnapshotId']
+
+        ec2.create_tags(
+            Resources=[encrypted_id],
+            Tags=[
+                {'Key': 'CreatedBy', 'Value': 'LambdaEncryptedBackup'},
+                {'Key': 'Date', 'Value': datetime.utcnow().strftime('%Y-%m-%d')}
+            ]
+        )
+
+        ec2.delete_snapshot(SnapshotId=snapshot_id)
+
+    cleanup_old_snapshots()
+
+def wait_for_snapshot(snapshot_id):
+    print("Waiting for snapshot to complete...")
+
+    while True:
+        response = ec2.describe_snapshots(SnapshotIds=[snapshot_id])
+        state = response['Snapshots'][0]['State']
+
+        if state == 'completed':
+            print("Snapshot ready")
+            return
+        elif state == 'error':
+            raise Exception("Snapshot failed")
+
+        time.sleep(15)
+
+def cleanup_old_snapshots():
+    snapshots = ec2.describe_snapshots(OwnerIds=['self'])['Snapshots']
+    cutoff = datetime.utcnow() - timedelta(days=RETENTION_DAYS)
